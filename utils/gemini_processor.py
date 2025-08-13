@@ -11,10 +11,12 @@ class GeminiProcessor:
             api_key = st.secrets["gemini"]["api_key"]
             genai.configure(api_key=api_key)
             self.model = genai.GenerativeModel("gemini-2.0-flash-exp")
+            self._original_data = None  # Store original data for post-processing
             print("[DEBUG] Gemini API initialized successfully")
         except Exception as e:
             print(f"[ERROR] Failed to initialize Gemini API: {e}")
             self.model = None
+            self._original_data = None
 
     def structure_document_data(
         self, document_data: Dict[str, Any], document_type: str = "unknown"
@@ -27,6 +29,9 @@ class GeminiProcessor:
             return {"error": "Gemini API not initialized"}
 
         try:
+            # Store original data for post-processing
+            self._original_data = document_data
+            
             # Create a comprehensive prompt
             prompt = self._create_universal_structuring_prompt(
                 document_data, document_type
@@ -68,6 +73,29 @@ class GeminiProcessor:
 
     def structure_excel_data(self, excel_data: Dict[str, Any]) -> Dict[str, Any]:
         """
+            3. **Summary Field Extraction and Cross-Check**:
+                - Extract summary fields such as total, subtotal, and total_tax if present in the document.
+                - If summary fields are present, use them for the overall invoice/PO totals and tax.
+                - If summary fields are missing, calculate totals by summing all line items and tax amounts.
+                - If there is a mismatch between calculated and summary totals, include both and flag the discrepancy in the output.
+
+            4. **Tax Rate and Amount Handling**:
+                - Extract tax rates and amounts from both line items and summary tables.
+                - If tax rate is given as a percentage (e.g., "9%"), convert to decimal (0.09).
+
+            5. **Currency Normalization**:
+                - Always return currency as "INR" and ignore symbols like "₹".
+
+            6. **Fallback Logic**:
+                - If any value is missing, infer it from other available fields (e.g., calculate total_value if missing).
+
+            7. **Contextual Awareness**:
+                - Use all available context from both line items and summary fields to ensure accuracy.
+
+            8. **Strict Output Format**:
+                - Respond ONLY with valid JSON using the schema below.
+                - Use null for missing values, not empty strings.
+                - Do not add any extra commentary or markdown.
         Legacy method for Excel data - internally uses the universal method.
         """
         return self.structure_document_data(excel_data, "Excel")
@@ -102,26 +130,43 @@ TASK:
      - customer_id  
      - product_number  
      - product_name  
-     - units  
-     - unit_price  
+     - units
+     - unit_price
      - tax_rate  
-     - tax_amount  
-     - total_value  
+     - tax_amount
+     - total_value
      - currency  
      - issue_date  
      - due_date  
      - payment_terms
 
-3. **Entity Grouping**:
+3. **CRITICAL: Financial Data Extraction**:
+   - Look for financial_info sections containing total, subtotal, total_tax amounts
+   - For line items: extract units, unit_price, tax_rate, tax_amount from items array
+   - For invoices: total_value should include taxes (subtotal + total_tax)
+   - If CGST + SGST are present, combine them (e.g., 9% + 9% = 18% = 0.18)
+   - Use financial_info.total.amount as the final invoice total when available
+
+4. **Entity Grouping**:
    - Group line items under their respective PO or invoice based on IDs or context.
 
 4. **Dates**:
    - Return all dates in YYYY-MM-DD format when possible.
 
 5. **Value Selection Rules**:
-   - Always choose the base price per unit as `unit_price` (not the item price if both are present).
-   - If total_value is missing but units and unit_price are present, calculate it as:
-     `total_value = units * unit_price` (include tax_amount if tax_rate is provided).
+   - Always choose the base price per unit as `unit_price` (not the item price if both are present)
+   - For total_value: Use financial_info.total.amount if available, otherwise calculate as subtotal + tax
+   - For tax calculations: Look for CGST + SGST values and combine them
+   - If tax rate is percentage (e.g., "9%"), convert to decimal (0.09)
+   - Always prioritize summary financial data over calculated values
+
+6. **CALCULATION EXAMPLE** (for the given invoice):
+   - Product: Bajaj 2000 TM 20L
+   - Units: 30, Unit Price: 3389
+   - Subtotal: 30 × 3389 = 101,670
+   - CGST: 9,150.30 (9%), SGST: 9,150.30 (9%) = Total Tax: 18,300.60
+   - Tax Rate: 18% (0.18), Tax Amount: 18,300.60
+   - Total Value: 101,670 + 18,300.60 = 119,970.60
 
 OUTPUT FORMAT:
 Respond ONLY with valid JSON in the following format:
@@ -156,11 +201,14 @@ Respond ONLY with valid JSON in the following format:
 }}
 
 IMPORTANT:
-- Use ONLY the above standard keys in the JSON.
-- If a value is missing, return null but still include the key.
-- Do not calculate missing values; leave them null if not found.
-- Always select the base price per unit as `unit_price` when available.
-- Ensure valid JSON without comments or extra text.
+- Use ONLY the above standard keys in the JSON
+- CRITICAL: Extract financial totals from financial_info section when available
+- For invoices: total_value should be the final amount including all taxes
+- If financial_info.total.amount exists, use it as the invoice total
+- If tax breakdown exists (CGST + SGST), combine them into tax_rate and tax_amount
+- Always return currency as "INR" (ignore ₹ symbols)
+- If a value is missing, return null but still include the key
+- Ensure valid JSON without comments or extra text
 """
         return prompt
 
@@ -213,6 +261,9 @@ IMPORTANT:
             print("[DEBUG] Successfully parsed Gemini response")
             print(f"[DEBUG] Structured data keys: {list(structured_data.keys())}")
             
+            # Apply post-processing to fix financial calculations
+            structured_data = self._post_process_financial_data(structured_data)
+            
             # Validate required fields
             if "line_items" in structured_data:
                 item_count = len(structured_data["line_items"])
@@ -239,6 +290,105 @@ IMPORTANT:
                 "error": str(e),
                 "raw_response": response_text[:1000],
             }
+    
+    def _post_process_financial_data(self, structured_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Post-process financial data to ensure correct calculations using original Azure AI data
+        """
+        print("[DEBUG] Post-processing financial data...")
+        
+        if "documents" not in structured_data:
+            return structured_data
+        
+        # Get original financial info from Azure AI if available
+        original_financial_info = {}
+        if hasattr(self, '_original_data') and self._original_data:
+            original_financial_info = self._original_data.get('financial_info', {})
+            print(f"[DEBUG] Original financial_info available: {list(original_financial_info.keys())}")
+        
+        for doc in structured_data["documents"]:
+            if "line_items" not in doc:
+                continue
+                
+            print(f"[DEBUG] Processing {len(doc['line_items'])} line items...")
+            
+            # Get document totals from original data if available
+            document_total = None
+            document_subtotal = None
+            document_tax_total = None
+            
+            if original_financial_info:
+                if 'total' in original_financial_info:
+                    document_total = original_financial_info['total'].get('amount', 0)
+                    print(f"[DEBUG] Using original document total: {document_total}")
+                
+                if 'subtotal' in original_financial_info:
+                    document_subtotal = original_financial_info['subtotal'].get('amount', 0)
+                    print(f"[DEBUG] Using original document subtotal: {document_subtotal}")
+                
+                if 'total_tax' in original_financial_info:
+                    document_tax_total = original_financial_info['total_tax'].get('amount', 0)
+                    print(f"[DEBUG] Using original document tax total: {document_tax_total}")
+            
+            # Calculate total from line items for comparison
+            calculated_subtotal = 0
+            calculated_tax_total = 0
+            
+            for item in doc["line_items"]:
+                # Fix individual line item calculations
+                units = item.get("units", 0) or 0
+                unit_price = item.get("unit_price", 0) or 0
+                tax_rate = item.get("tax_rate", 0) or 0
+                
+                if units > 0 and unit_price > 0:
+                    # Calculate subtotal (before tax)
+                    subtotal = units * unit_price
+                    calculated_subtotal += subtotal
+                    
+                    # Calculate tax amount
+                    if tax_rate > 0:
+                        # If tax_rate is between 0 and 1, it's already decimal
+                        # If it's > 1, convert from percentage
+                        if tax_rate > 1:
+                            tax_rate = tax_rate / 100
+                        
+                        tax_amount = subtotal * tax_rate
+                        calculated_tax_total += tax_amount
+                        item["tax_amount"] = round(tax_amount, 2)
+                        item["tax_rate"] = tax_rate
+                    else:
+                        item["tax_amount"] = 0
+                        item["tax_rate"] = 0
+                    
+                    # For line item total, always calculate from subtotal + tax
+                    total_value = subtotal + item.get("tax_amount", 0)
+                    item["total_value"] = round(total_value, 2)
+                    
+                    print(f"[DEBUG] Item {item.get('product_number', 'N/A')}: {units} x {unit_price} = {subtotal}, tax: {item.get('tax_amount', 0)}, total: {total_value}")
+            
+            # Use original document totals if available and different from calculated
+            calculated_total = calculated_subtotal + calculated_tax_total
+            print(f"[DEBUG] Calculated from line items - Subtotal: {calculated_subtotal}, Tax: {calculated_tax_total}, Total: {calculated_total}")
+            
+            # If we have original totals that differ significantly, use them
+            if document_total and abs(document_total - calculated_total) > 1:
+                print(f"[DEBUG] Using original document total {document_total} instead of calculated {calculated_total}")
+                # Store document-level totals for comparison
+                doc["document_totals"] = {
+                    "subtotal": document_subtotal or calculated_subtotal,
+                    "tax_total": document_tax_total or calculated_tax_total,
+                    "total": document_total,
+                    "original_data_used": True
+                }
+            else:
+                doc["document_totals"] = {
+                    "subtotal": calculated_subtotal,
+                    "tax_total": calculated_tax_total,
+                    "total": calculated_total,
+                    "original_data_used": False
+                }
+        
+        return structured_data
     
     def compare_invoice_vs_po(self, invoice_data: Dict[str, Any], po_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -341,7 +491,7 @@ You will be given **two structured JSON documents** — one for a Purchase Order
 TASK:
 1. Compare ONLY the "line_items" arrays in both documents.
 2. Before comparison, normalize product_number by extracting ONLY the numeric part (ignore any letters, prefixes, or symbols).
-   Example: "VI-3423" and "3423" should be considered the same product_number.
+   Example: "VI-3423" and "3423" should be considered the same product_number. There is one more concern is that sometime the product ids are missing from the invoices or pos or maybe the extracted product id is acutally a HSN/SAC, thus please if you think if there is the case please match the products based on the description of the product and perform fuzzy matching on each item.
 3. Match products based on this normalized product_number.
 4. For each matched product, compare:
    - units
