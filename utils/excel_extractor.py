@@ -27,9 +27,10 @@ def extract_excel_info(uploaded_file) -> Dict[str, Any]:
                     "names": df.columns.tolist(),
                     "data_types": df.dtypes.astype(str).to_dict()
                 },
-                "sample_data": {
-                    "first_5_rows": df.head().fillna("").to_dict(orient="records"),
-                    "last_5_rows": df.tail().fillna("").to_dict(orient="records") if len(df) > 5 else []
+                "all_data": df.fillna("").to_dict(orient="records"),
+                "sample_preview": {
+                    "first_3_rows": df.head(3).fillna("").to_dict(orient="records"),
+                    "last_3_rows": df.tail(3).fillna("").to_dict(orient="records") if len(df) > 3 else []
                 },
                 "summary_statistics": {},
                 "potential_key_columns": [],
