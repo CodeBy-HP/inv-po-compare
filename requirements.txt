@@ -4,3 +4,4 @@ pandas
 openpyxl
 xlrd
 google-generativeai
+python-docx

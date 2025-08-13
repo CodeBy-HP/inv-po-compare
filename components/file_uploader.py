@@ -6,6 +6,6 @@ def file_upload_component() -> Optional[st.runtime.uploaded_file_manager.Uploade
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=["pdf", "xlsx", "xls", "docx", "doc"],
-        help="Supported formats: PDF, Excel, Word"
+        help="Supported formats: PDF, Excel (.xlsx, .xls), Word (.docx, .doc)"
     )
     return uploaded_file

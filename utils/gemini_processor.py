@@ -6,7 +6,7 @@ from typing import Dict, Any
 
 class GeminiProcessor:
     def __init__(self):
-        """Initialize Gemini API with the API key from secrets"""
+        """Initialize Gemini API with the API key from Streamlit secrets."""
         try:
             api_key = st.secrets["gemini"]["api_key"]
             genai.configure(api_key=api_key)
@@ -16,53 +16,68 @@ class GeminiProcessor:
             print(f"[ERROR] Failed to initialize Gemini API: {e}")
             self.model = None
 
-    def structure_excel_data(self, excel_data: Dict[str, Any]) -> Dict[str, Any]:
+    def structure_document_data(
+        self, document_data: Dict[str, Any], document_type: str = "unknown"
+    ) -> Dict[str, Any]:
         """
-        Send Excel data to Gemini for contextual structuring
+        Process and structure any document data (Excel, PDF, Word, scanned images, etc.)
+        using Gemini for contextual analysis.
         """
         if not self.model:
             return {"error": "Gemini API not initialized"}
 
         try:
-            # Create a comprehensive prompt for Gemini
-            prompt = self._create_structuring_prompt(excel_data)
+            # Create a comprehensive prompt
+            prompt = self._create_universal_structuring_prompt(
+                document_data, document_type
+            )
 
-            print("[DEBUG] Sending data to Gemini for contextual analysis...")
+            print(f"[DEBUG] Sending {document_type} data to Gemini for contextual analysis...")
             print(f"[DEBUG] Prompt length: {len(prompt)} characters")
 
             # Send to Gemini
             response = self.model.generate_content(prompt)
-
             print("[DEBUG] Received response from Gemini")
 
-            # Parse the JSON response
+            # Parse JSON response
             structured_data = self._parse_gemini_response(response.text)
-
             return structured_data
 
         except Exception as e:
-            error_msg = f"Failed to process with Gemini: {str(e)}"
+            error_msg = f"Failed to process {document_type} with Gemini: {str(e)}"
             print(f"[ERROR] {error_msg}")
             return {"error": error_msg}
 
-    def _create_structuring_prompt(self, excel_data: Dict[str, Any]) -> str:
+    def structure_excel_data(self, excel_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Create a detailed prompt for Gemini to structure the Excel data
+        Legacy method for Excel data - internally uses the universal method.
+        """
+        return self.structure_document_data(excel_data, "Excel")
+
+    def _create_universal_structuring_prompt(
+        self, document_data: Dict[str, Any], document_type: str
+    ) -> str:
+        """
+        Create a detailed prompt for Gemini to normalize and structure document data
+        into a predefined JSON schema.
         """
         prompt = f"""
 You are an expert in processing purchase orders (PO) and invoices.
 
-I have extracted raw data from an Excel file using Python, but the formatting may be inconsistent or ambiguous.
-Your job is to analyze this data contextually and produce a **fully normalized, structured JSON output** using ONLY the predefined standard business keys below.
+I have extracted raw data from a document (could be PDF, Excel, Word, scanned image, or any other source).
+The extraction may come from OCR, table parsing, or plain text, so the formatting can be inconsistent, incomplete, or ambiguous.
 
-EXCEL DATA:
-{json.dumps(excel_data, indent=2)}
+Your job is to analyze this data contextually and produce a **fully normalized, structured JSON output**
+using ONLY the predefined standard business keys below.
+
+RAW EXTRACTED DATA:
+{json.dumps(document_data, indent=2)}
 
 TASK:
 1. **Context Detection**: Determine if the data is related to Purchase Orders, Invoices, or both.
 
 2. **Standardized Key Mapping**:
-   - Even if the raw Excel uses synonyms, abbreviations, or different column orders, map them to these exact keys only:
+   - Even if the raw data uses synonyms, abbreviations, or different column orders, map them to these exact keys only:
      - purchase_order_id  
      - invoice_id  
      - vendor_name  
@@ -80,13 +95,17 @@ TASK:
      - issue_date  
      - due_date  
      - payment_terms
-   - For `unit_price`, choose the base price per unit (before any tax, shipping, or discounts) instead of total price or aggregated item price.
 
 3. **Entity Grouping**:
    - Group line items under their respective PO or invoice based on IDs or context.
 
 4. **Dates**:
    - Return all dates in YYYY-MM-DD format when possible.
+
+5. **Value Selection Rules**:
+   - Always choose the base price per unit as `unit_price` (not the item price if both are present).
+   - If total_value is missing but units and unit_price are present, calculate it as:
+     `total_value = units * unit_price` (include tax_amount if tax_rate is provided).
 
 OUTPUT FORMAT:
 Respond ONLY with valid JSON in the following format:
@@ -115,28 +134,24 @@ Respond ONLY with valid JSON in the following format:
       ],
       "issue_date": "YYYY-MM-DD",
       "due_date": "YYYY-MM-DD",
-      "payment_terms": "...",
+      "payment_terms": "..."
     }}
   ]
 }}
 
 IMPORTANT:
 - Use ONLY the above standard keys in the JSON.
-- If a value is missing, return null but still include the key.
-- Do not calculate any missing values; leave them null if not found in the data.
-- Always select the base price per unit as `unit_price` when available, even if other price types are present.
-- Do not hardcode assumptions; infer meaning from context only.
+- If a value is missing and cannot be calculated, return null but still include the key.
 - Ensure valid JSON without comments or extra text.
 """
-
         return prompt
 
     def _parse_gemini_response(self, response_text: str) -> Dict[str, Any]:
         """
-        Parse and validate Gemini's JSON response
+        Parse and validate Gemini's JSON response.
         """
         try:
-            # Clean the response text (remove any markdown formatting)
+            # Clean up response (remove markdown formatting if present)
             cleaned_response = response_text.strip()
             if cleaned_response.startswith("```json"):
                 cleaned_response = cleaned_response[7:]
@@ -145,7 +160,6 @@ IMPORTANT:
 
             # Parse JSON
             structured_data = json.loads(cleaned_response.strip())
-
             print("[DEBUG] Successfully parsed Gemini response")
             print(f"[DEBUG] Structured data keys: {list(structured_data.keys())}")
 
@@ -161,7 +175,7 @@ IMPORTANT:
             return {
                 "success": False,
                 "error": "Invalid JSON response from Gemini",
-                "raw_response": response_text[:1000],  # First 1000 chars for debugging
+                "raw_response": response_text[:1000],
             }
         except Exception as e:
             print(f"[ERROR] Unexpected error parsing response: {e}")
